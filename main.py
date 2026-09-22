@@ -2,6 +2,7 @@ import json
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from mitmproxy import http
 
@@ -9,9 +10,24 @@ AKTO_AUTHORIZATION = os.environ.get("AKTO_AUTHORIZATION", "")
 AKTO_ACCOUNT_ID = os.environ.get("AKTO_ACCOUNT_ID", "")
 AKTO_VXLAN_ID = os.environ.get("AKTO_VXLAN_ID", "")
 
-AKTO_GUARDRAILS_HOST = f"https://{AKTO_ACCOUNT_ID}-guardrails.akto.io"
-VALIDATE_REQUEST_URL = f"{AKTO_GUARDRAILS_HOST}/api/validate/request"
-VALIDATE_RESPONSE_URL = f"{AKTO_GUARDRAILS_HOST}/api/validate/response"
+REQUIRED_VALIDATE_QUERY_PARAMS = {
+    "guardrails": "true",
+    "ingest_data": "true",
+    "response_guardrails": "true",
+}
+
+
+def with_required_query_params(url, required):
+    parts = urllib.parse.urlsplit(url)
+    query = dict(urllib.parse.parse_qsl(parts.query))
+    for key, value in required.items():
+        query.setdefault(key, value)
+    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+
+
+AKTO_VALIDATE_URL = with_required_query_params(
+    os.environ.get("AKTO_VALIDATE_URL", ""), REQUIRED_VALIDATE_QUERY_PARAMS
+)
 
 pending = {}
 
@@ -70,12 +86,20 @@ def build_base_payload(flow):
         "method": flow.request.method,
         "requestHeaders": json.dumps(dict(flow.request.headers)),
         "requestPayload": flow.request.get_text(strict=False),
+        "responseHeaders": "{}",
+        "responsePayload": "{}",
         "authorization": AKTO_AUTHORIZATION,
         "ip": flow.client_conn.peername[0] if flow.client_conn else "127.0.0.1",
         "destIp": flow.server_conn.address[0] if flow.server_conn else "127.0.0.1",
         "time": str(int(time.time() * 1000)),
         "statusCode": "200",
         "status": "200",
+        "type": None,
+        "direction": None,
+        "process_id": None,
+        "socket_id": None,
+        "daemonset_id": None,
+        "enabled_graph": None,
         "akto_account_id": AKTO_ACCOUNT_ID,
         "akto_vxlan_id": AKTO_VXLAN_ID,
         "is_pending": "false",
@@ -135,7 +159,7 @@ def request(flow: http.HTTPFlow):
     payload = build_base_payload(flow)
 
     validation = post_json(
-        VALIDATE_REQUEST_URL,
+        AKTO_VALIDATE_URL,
         payload
     )
 
@@ -160,6 +184,8 @@ def response(flow: http.HTTPFlow):
 
     response_body = flow.response.get_text(strict=False)
 
+    payload["requestHeaders"] = "{}"
+    payload["requestPayload"] = "{}"
     payload["responseHeaders"] = json.dumps(
         dict(flow.response.headers)
     )
@@ -171,7 +197,7 @@ def response(flow: http.HTTPFlow):
     print(response_body[:2000])
 
     response_validation = post_json(
-        VALIDATE_RESPONSE_URL,
+        AKTO_VALIDATE_URL,
         payload
     )
 

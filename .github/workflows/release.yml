@@ -1,0 +1,84 @@
+name: Release Akto lambda egress proxy
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: 'The version number for the release'
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1.7.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: GitHub_to_AWS_via_FederatedOIDC
+          aws-region: us-east-1
+
+      - name: Login to Amazon ECR Public
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+        with:
+          mask-password: 'true'
+          registry-type: public
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Show Docker info
+        run: |
+          echo "========== Docker Version =========="
+          docker version
+
+          echo "========== Docker Buildx Version =========="
+          docker buildx version
+
+          echo "========== Docker Buildx Builders =========="
+          docker buildx ls
+
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REGISTRY_ALIAS: p7q3h0z2
+          ECR_REPOSITORY: lambda-egress-proxy
+          IMAGE_TAG: ${{ github.event.inputs.release_version }}
+
+        run: |
+          set -ex
+
+          echo "========== Build Variables =========="
+          echo "ECR_REGISTRY=$ECR_REGISTRY"
+          echo "REGISTRY_ALIAS=$REGISTRY_ALIAS"
+          echo "ECR_REPOSITORY=$ECR_REPOSITORY"
+          echo "IMAGE_TAG=$IMAGE_TAG"
+
+          IMAGE_VERSIONED="$ECR_REGISTRY/$REGISTRY_ALIAS/$ECR_REPOSITORY:$IMAGE_TAG"
+          IMAGE_LATEST="$ECR_REGISTRY/$REGISTRY_ALIAS/$ECR_REPOSITORY:latest"
+
+          echo "========== Final Images =========="
+          echo "$IMAGE_VERSIONED"
+          echo "$IMAGE_LATEST"
+
+          echo "========== Starting Docker Build =========="
+
+          docker buildx build \
+            --platform linux/arm64/v8,linux/amd64 \
+            -t "$IMAGE_VERSIONED" \
+            -t "$IMAGE_LATEST" \
+            . \
+            --push
+
+          echo "========== Docker Push Complete =========="
+          echo "Successfully pushed: $IMAGE_VERSIONED"
+          echo "Successfully pushed: $IMAGE_LATEST"

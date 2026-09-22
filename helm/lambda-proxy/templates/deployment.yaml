@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-lambda-proxy
+  labels:
+    app: {{ .Release.Name }}-lambda-proxy
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-lambda-proxy
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-lambda-proxy
+    spec:
+      containers:
+        - name: lambda-proxy
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: proxy
+              containerPort: 3128
+          {{- if .Values.aktoSecret.existingSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.aktoSecret.existingSecret }}
+          {{- end }}
+          livenessProbe:
+            tcpSocket:
+              port: proxy
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: proxy
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          {{- if .Values.mitmproxyCA.existingSecret }}
+          volumeMounts:
+            - name: mitmproxy-ca
+              mountPath: /root/.mitmproxy
+              readOnly: true
+          {{- end }}
+      {{- if .Values.mitmproxyCA.existingSecret }}
+      volumes:
+        - name: mitmproxy-ca
+          secret:
+            secretName: {{ .Values.mitmproxyCA.existingSecret }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

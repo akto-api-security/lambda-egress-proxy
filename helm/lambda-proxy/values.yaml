@@ -1,0 +1,46 @@
+image:
+  repository: ""  # e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/lambda-proxy
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Kept at 1: mitmproxy's CA cert is only consistent across pods if the
+# mitmproxyCA secret below is set. Do not scale this up without setting it.
+replicaCount: 1
+
+service:
+  type: LoadBalancer
+  port: 3128
+  # Requires the AWS Load Balancer Controller installed on the cluster.
+  # "internal" keeps the NLB VPC-only so it's reachable from a VPC-attached
+  # Lambda but not the public internet.
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "external"
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internal"
+
+# Secret with keys AKTO_AUTHORIZATION, AKTO_ACCOUNT_ID, AKTO_VXLAN_ID, created out of band, e.g.:
+#   kubectl create secret generic akto-proxy-secrets \
+#     --from-literal=AKTO_AUTHORIZATION='...' \
+#     --from-literal=AKTO_ACCOUNT_ID='1726615470' \
+#     --from-literal=AKTO_VXLAN_ID='...'
+aktoSecret:
+  existingSecret: ""
+
+# Secret containing a pre-generated mitmproxy CA (mitmproxy-ca.pem,
+# mitmproxy-ca-cert.pem, mitmproxy-ca-cert.cer, mitmproxy-ca-cert.p12,
+# mitmproxy-dhparam.pem), mounted at /root/.mitmproxy so the CA survives
+# pod restarts/updates. See helm/lambda-proxy/README.md to generate it.
+mitmproxyCA:
+  existingSecret: ""
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

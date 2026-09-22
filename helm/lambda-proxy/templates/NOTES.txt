@@ -1,0 +1,17 @@
+lambda-proxy deployed. Once the NLB is provisioned (can take a couple of minutes), get its DNS name:
+
+  kubectl get svc {{ .Release.Name }}-lambda-proxy -n {{ .Release.Namespace }} \
+    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+
+Point the Lambda function's HTTPS_PROXY environment variable at it:
+
+  HTTPS_PROXY=http://<that-hostname>:{{ .Values.service.port }}
+
+Requirements for this to actually work:
+- The Lambda function must be attached to a VPC with a route to the NLB's subnets
+  (same VPC, or peered/Transit Gateway with routing), and its security group must
+  allow outbound TCP {{ .Values.service.port }} to the NLB / node security group.
+- The Lambda runtime must trust the mitmproxy CA cert for TLS interception to work,
+  or Bedrock calls will fail with a certificate verification error. Bundle
+  mitmproxy-ca-cert.pem (from the secret set in mitmproxyCA.existingSecret) into
+  the function or a Lambda layer and point the SDK/runtime's CA bundle env var at it.

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: lambda-proxy
+description: mitmproxy forward proxy that validates AWS Bedrock traffic through Akto guardrails
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

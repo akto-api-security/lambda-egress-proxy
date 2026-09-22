@@ -16,6 +16,16 @@ docker run --name lambda-proxy --restart unless-stopped \
   lambda-proxy
 ```
 
+By default the guardrails host is derived from `AKTO_ACCOUNT_ID` as
+`https://<AKTO_ACCOUNT_ID>-guardrails.akto.io`. Set `AKTO_GUARDRAILS_HOST` to a
+full URL to override it — including the scheme, so it doesn't have to be
+`https`. For example, to call an Akto guardrails service running as an
+internal pod over plain HTTP:
+
+```sh
+-e AKTO_GUARDRAILS_HOST='http://akto-guardrails.akto-system.svc.cluster.local:8080'
+```
+
 Set the Lambda function's `HTTPS_PROXY` environment variable to the EC2
 instance's reachable address, for example `http://10.0.1.25:3128`.
 

@@ -29,6 +29,8 @@ AKTO_VALIDATE_URL = with_required_query_params(
     os.environ.get("AKTO_VALIDATE_URL", ""), REQUIRED_VALIDATE_QUERY_PARAMS
 )
 
+AKTO_HEALTH_PATH = os.environ.get("AKTO_HEALTH_PATH", "/akto-health")
+
 pending = {}
 
 
@@ -147,6 +149,15 @@ def return_akto_error(flow, validation):
 
 
 def request(flow: http.HTTPFlow):
+    if flow.request.path.startswith(AKTO_HEALTH_PATH):
+        print(f"\n[HEALTH CHECK] {flow.request.method} {flow.request.pretty_url}")
+        flow.response = http.Response.make(
+            200,
+            json.dumps({"status": "ok"}),
+            {"Content-Type": "application/json"}
+        )
+        return
+
     host = flow.request.pretty_host
 
     if "bedrock-runtime" not in host:

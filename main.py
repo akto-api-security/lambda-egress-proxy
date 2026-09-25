@@ -1,6 +1,8 @@
+import base64
 import json
 import os
 import socket
+import struct
 import time
 import urllib.error
 import urllib.parse
@@ -9,8 +11,6 @@ from urllib.parse import urlparse
 from mitmproxy import http
 
 AKTO_AUTHORIZATION = os.environ.get("AKTO_AUTHORIZATION", "")
-AKTO_ACCOUNT_ID = os.environ.get("AKTO_ACCOUNT_ID", "")
-AKTO_VXLAN_ID = os.environ.get("AKTO_VXLAN_ID", "")
 
 REQUIRED_VALIDATE_QUERY_PARAMS = {
     "guardrails": "true",
@@ -138,8 +138,8 @@ def build_base_payload(flow):
         "socket_id": None,
         "daemonset_id": None,
         "enabled_graph": None,
-        "akto_account_id": AKTO_ACCOUNT_ID,
-        "akto_vxlan_id": AKTO_VXLAN_ID,
+        "akto_account_id": "",
+        "akto_vxlan_id": "",
         "is_pending": "false",
         "source": "MIRRORING",
         "tag": json.dumps({
@@ -195,20 +195,179 @@ def modified_payload(resp, phase=None):
     return None
 
 
+def decode_event_stream(raw):
+    """Yield (event type, JSON body) per AWS event-stream frame. Bedrock only
+    sends string headers (type 7), so other header types are not handled."""
+    offset = 0
+    while offset + 12 <= len(raw):
+        total_len, headers_len = struct.unpack_from(">II", raw, offset)
+        if total_len < 16 or offset + total_len > len(raw):
+            return
+        headers, i, end = {}, offset + 12, offset + 12 + headers_len
+        while i < end and raw[i + 1 + raw[i]] == 7:
+            name = raw[i + 1:i + 1 + raw[i]].decode()
+            i += 2 + raw[i]
+            (value_len,) = struct.unpack_from(">H", raw, i)
+            headers[name] = raw[i + 2:i + 2 + value_len].decode()
+            i += 2 + value_len
+        if headers.get(":message-type") == "event":
+            yield headers.get(":event-type"), json.loads(raw[end:offset + total_len - 4])
+        offset += total_len
+
+
+# Tool calls and results from every model format are normalized to
+# {id, name, input} and {id, content, is_error}. Formats covered: Converse and
+# Nova (toolUse/toolResult), Anthropic (tool_use/tool_result), OpenAI-style
+# chat - gpt-oss, Mistral, AI21, Qwen, DeepSeek (tool_calls / role "tool"),
+# and Cohere (tool_calls / tool_results). Llama emits tool calls as plain text,
+# so its traffic is validated but tool calls are not extracted.
+
+def _json_or_raw(value):
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value) if value else {}
+    except ValueError:
+        return value
+
+
+def tool_calls_in(message):
+    """Tool calls in an assistant message or non-streaming response body."""
+    calls = []
+    content = message.get("content")
+    for b in content if isinstance(content, list) else []:
+        if "toolUse" in b:
+            t = b["toolUse"]
+            calls.append({"id": t.get("toolUseId"), "name": t.get("name"), "input": t.get("input")})
+        elif b.get("type") == "tool_use":
+            calls.append({"id": b.get("id"), "name": b.get("name"), "input": b.get("input")})
+    for t in message.get("tool_calls") or []:
+        if "function" in t:
+            fn = t["function"]
+            calls.append({"id": t.get("id"), "name": fn.get("name"), "input": _json_or_raw(fn.get("arguments"))})
+        else:  # Cohere calls carry no id
+            calls.append({"id": t.get("name"), "name": t.get("name"), "input": t.get("parameters")})
+    return calls
+
+
+def response_message(body):
+    if "output" in body:
+        return body["output"].get("message") or {}
+    if body.get("choices"):
+        return body["choices"][0].get("message") or {}
+    return body
+
+
+def parse_stream(raw):
+    """(text, tool calls, decoded events) from a ConverseStream or
+    InvokeModelWithResponseStream body."""
+    text, calls, events = [], {}, []
+    for event, body in decode_event_stream(raw):
+        if event == "chunk":
+            body = json.loads(base64.b64decode(body["bytes"]))
+            # Nova's InvokeModel stream wraps Converse events: {"contentBlockDelta": {...}}
+            wrapped = next((k for k in ("contentBlockStart", "contentBlockDelta") if k in body), None)
+            event, body = (wrapped, body[wrapped]) if wrapped else (body.get("type") or body.get("event_type"), body)
+        events.append(body)
+        index = body.get("contentBlockIndex", body.get("index"))
+
+        if event == "contentBlockStart" and "toolUse" in body.get("start", {}):
+            t = body["start"]["toolUse"]
+            calls[index] = {"id": t.get("toolUseId"), "name": t.get("name"), "input": ""}
+        elif event == "content_block_start" and body["content_block"].get("type") == "tool_use":
+            b = body["content_block"]
+            calls[index] = {"id": b.get("id"), "name": b.get("name"), "input": ""}
+        elif event in ("contentBlockDelta", "content_block_delta"):
+            delta = body.get("delta", {})
+            text.append(delta.get("text", ""))
+            if index in calls:
+                calls[index]["input"] += (delta.get("toolUse") or {}).get("input", "") or delta.get("partial_json", "")
+        elif event == "tool-calls-generation":
+            for t in body.get("tool_calls") or []:
+                calls[len(calls)] = {"id": t.get("name"), "name": t.get("name"), "input": t.get("parameters")}
+        elif event == "text-generation":
+            text.append(body.get("text", ""))
+        elif body.get("choices"):
+            choice = body["choices"][0]
+            message = choice.get("delta") or choice.get("message") or {}
+            text.append(message.get("content") or choice.get("text") or "")
+            for i, t in enumerate(message.get("tool_calls") or []):
+                call = calls.setdefault(t.get("index", i), {"id": None, "name": None, "input": ""})
+                fn = t.get("function") or {}
+                call["id"] = t.get("id") or call["id"]
+                call["name"] = fn.get("name") or call["name"]
+                call["input"] += fn.get("arguments") or ""
+        else:  # Llama, Titan, legacy Claude text completions
+            text.append(body.get("generation") or body.get("outputText") or body.get("completion") or "")
+
+    for call in calls.values():
+        call["input"] = _json_or_raw(call["input"])
+    return "".join(text), list(calls.values()), events
+
+
+def tool_results_in_request(flow):
+    """(tool call, result) pairs for the results new in this request. The whole
+    conversation is resent on every call, so older ones were already reported."""
+    try:
+        body = json.loads(flow.request.get_text(strict=False))
+        messages = body.get("messages") or []
+    except (ValueError, AttributeError):
+        return []
+
+    if body.get("tool_results"):  # Cohere sends only the current turn's results
+        return [(
+            {"id": r["call"].get("name"), "name": r["call"].get("name"), "input": r["call"].get("parameters")},
+            {"id": r["call"].get("name"), "content": r.get("outputs"), "is_error": False},
+        ) for r in body["tool_results"]]
+
+    results = []
+    i = len(messages)
+    while i and messages[i - 1].get("role") == "tool":  # OpenAI style
+        i -= 1
+    for m in messages[i:]:
+        results.append({"id": m.get("tool_call_id"), "content": m.get("content"), "is_error": False})
+
+    last = messages[-1] if messages else {}
+    if not results and last.get("role") == "user" and isinstance(last.get("content"), list):
+        for b in last["content"]:
+            if "toolResult" in b:
+                r = b["toolResult"]
+                results.append({"id": r.get("toolUseId"), "content": r.get("content"), "is_error": r.get("status") == "error"})
+            elif b.get("type") == "tool_result":
+                results.append({"id": b.get("tool_use_id"), "content": b.get("content"), "is_error": bool(b.get("is_error"))})
+
+    calls = {c["id"]: c for m in messages if m.get("role") == "assistant" for c in tool_calls_in(m)}
+    return [(calls.get(r["id"], {"id": r["id"]}), r) for r in results]
+
+
+def tool_payload(flow, tool_use, request_body=None, response_body=None):
+    payload = build_base_payload(flow)
+    payload.update({
+        "path": "/tools/" + urllib.parse.quote(tool_use.get("name") or "unknown", safe=""),
+        "method": "POST",
+        "requestHeaders": json.dumps({"host": flow.request.pretty_host}),
+        "requestPayload": json.dumps(request_body) if request_body else "{}",
+        "responsePayload": json.dumps(response_body) if response_body else "{}",
+    })
+    return payload
+
+
 def return_akto_error(flow, validation, phase=None):
     print("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     print("         BLOCKED BY AKTO")
     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     print(json.dumps(validation, indent=2))
     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
-    body = json.dumps(validation)
+    reason = block_reason(validation, phase)
+    # AWS SDKs surface the body's "message" as the error text.
+    body = json.dumps({"message": f"Blocked by Akto: {reason}", "akto": validation})
     flow.response = http.Response.make(
         403,
         body,
         {
             "Content-Type": "application/json",
             "X-Akto-Guardrail": "blocked",
-            "X-Akto-Guardrail-Reason": block_reason(validation, phase)
+            "X-Akto-Guardrail-Reason": reason
         }
     )
 
@@ -246,6 +405,18 @@ def request(flow: http.HTTPFlow):
         return_akto_error(flow, validation, "requestResult")
         return
 
+    for tool_use, tool_result in tool_results_in_request(flow):
+        print(f"\n================ TOOL RESULT: {tool_use.get('name')} ================")
+        result_validation = post_json(AKTO_VALIDATE_URL, tool_payload(flow, tool_use, response_body={
+            "jsonrpc": "2.0",
+            "id": tool_result["id"],
+            "result": {"content": tool_result["content"], "isError": tool_result["is_error"]},
+        }))
+        if is_blocked(result_validation, "responseResult"):
+            print(">>> TOOL RESULT BLOCKED BY AKTO")
+            return_akto_error(flow, result_validation, "responseResult")
+            return
+
     # Request-side ModifiedPayload is deliberately NOT applied: SigV4 signs the
     # body hash, so rewriting it invalidates the signature and AWS rejects the
     # call with InvalidSignatureException. Re-signing would need the caller's
@@ -262,13 +433,23 @@ def response(flow: http.HTTPFlow):
 
     payload = pending.pop(flow.id)
 
+    stream = "eventstream" in flow.response.headers.get("content-type", "")
+    calls = []
     response_body = flow.response.get_text(strict=False)
+    try:
+        if stream:
+            # Report decoded content, not the binary event-stream frames. Formats
+            # with no text/tool parser fall back to the raw decoded events.
+            text, calls, events = parse_stream(flow.response.content)
+            response_body = json.dumps({"text": text, "toolCalls": calls} if text or calls else events)
+        else:
+            calls = tool_calls_in(response_message(json.loads(response_body)))
+    except Exception as e:
+        print(f"[TOOL PARSE ERROR] {e!r}")
 
-    payload["requestHeaders"] = "{}"
+    payload["requestHeaders"] = json.dumps({"host": flow.request.pretty_host})
     payload["requestPayload"] = "{}"
-    payload["responseHeaders"] = json.dumps(
-        dict(flow.response.headers)
-    )
+    payload["responseHeaders"] = json.dumps(dict(flow.response.headers))
     payload["responsePayload"] = response_body
     payload["statusCode"] = str(flow.response.status_code)
     payload["status"] = str(flow.response.status_code)
@@ -289,8 +470,24 @@ def response(flow: http.HTTPFlow):
         return_akto_error(flow, response_validation, "responseResult")
         return
 
+    # Checked before the response reaches the Lambda, so a blocked tool call
+    # never runs.
+    for call in calls:
+        print(f"\n================ TOOL CALL: {call['name']} ================")
+        call_validation = post_json(AKTO_VALIDATE_URL, tool_payload(flow, call, request_body={
+            "jsonrpc": "2.0",
+            "id": call["id"],
+            "method": "tools/call",
+            "params": {"name": call["name"], "arguments": call["input"]},
+        }))
+        if is_blocked(call_validation, "requestResult"):
+            print(">>> TOOL CALL BLOCKED BY AKTO")
+            return_akto_error(flow, call_validation, "requestResult")
+            return
+
     modified = modified_payload(response_validation, "responseResult")
-    if modified is not None:
+    # A plain-text body would corrupt the event stream the SDK expects.
+    if modified is not None and not stream:
         print(">>> RESPONSE MODIFIED BY AKTO")
         flow.response.set_text(modified)
 

@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import os
@@ -12,30 +13,32 @@ from mitmproxy import http
 
 AKTO_AUTHORIZATION = os.environ.get("AKTO_AUTHORIZATION", "")
 
-REQUIRED_VALIDATE_QUERY_PARAMS = {
-    "guardrails": "true",
-    "ingest_data": "true",
-    "response_guardrails": "true",
-}
-
-AKTO_HEALTH_PATH = os.environ.get("AKTO_HEALTH_PATH", "/akto-health")
+AKTO_HEALTH_PATH = os.environ.get("AKTO_HEALTH_PATH", "/health")
 
 # When Akto returns no usable verdict (timeout, unreachable backend, malformed
 # body), "false" lets traffic through unvalidated and "true" blocks it.
 AKTO_FAIL_CLOSED = os.environ.get("AKTO_FAIL_CLOSED", "false").lower() == "true"
 
+AKTO_VALIDATE_URL = os.environ.get("AKTO_VALIDATE_URL", "")
+AKTO_FLAGS = ("guardrails", "response_guardrails", "ingest_data")
 
-def with_required_query_params(url, required):
+AGENT_TAGS = {"gen-ai": "Gen AI", "ai-agent": "bedrock", "source": "AGENTIC"}
+
+
+def with_akto_flags(url, *flags):
+    """Set every Akto flag explicitly - the given ones true, the rest false -
+    overriding whatever the URL already has."""
     parts = urllib.parse.urlsplit(url)
     query = dict(urllib.parse.parse_qsl(parts.query))
-    for key, value in required.items():
-        query.setdefault(key, value)
+    query.update({flag: str(flag in flags).lower() for flag in AKTO_FLAGS})
     return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
 
 
-AKTO_VALIDATE_URL = with_required_query_params(
-    os.environ.get("AKTO_VALIDATE_URL", ""), REQUIRED_VALIDATE_QUERY_PARAMS
-)
+# Pre-checks verdict and store the request side. The record call carries the
+# full request + response, checks the response side and stores it too.
+CHECK_URL = with_akto_flags(AKTO_VALIDATE_URL, "guardrails", "ingest_data")
+RECORD_URL = with_akto_flags(AKTO_VALIDATE_URL, "response_guardrails", "ingest_data")
+
 
 def check_https_proxy_reachable():
     proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
@@ -142,16 +145,8 @@ def build_base_payload(flow):
         "akto_vxlan_id": "",
         "is_pending": "false",
         "source": "MIRRORING",
-        "tag": json.dumps({
-            "gen-ai": "Gen AI",
-            "ai-agent": "bedrock",
-            "source": "AGENTIC"
-        }),
-        "metadata": json.dumps({
-            "gen-ai": "Gen AI",
-            "ai-agent": "bedrock",
-            "source": "AGENTIC"
-        }),
+        "tag": json.dumps(AGENT_TAGS),
+        "metadata": json.dumps(AGENT_TAGS),
         "contextSource": "AGENTIC"
     }
 
@@ -340,15 +335,31 @@ def tool_results_in_request(flow):
     return [(calls.get(r["id"], {"id": r["id"]}), r) for r in results]
 
 
-def tool_payload(flow, tool_use, request_body=None, response_body=None):
+def tool_payload(flow, call, result=None):
+    """Akto payload for a tool call as MCP-style JSON-RPC: the tools/call
+    request, plus the tool's result once it is known."""
+    tags = json.dumps({**AGENT_TAGS, "tool-use": "Tool Execution"})
     payload = build_base_payload(flow)
     payload.update({
-        "path": "/tools/" + urllib.parse.quote(tool_use.get("name") or "unknown", safe=""),
+        "path": "/tools/" + urllib.parse.quote(call.get("name") or "unknown", safe=""),
         "method": "POST",
-        "requestHeaders": json.dumps({"host": flow.request.pretty_host}),
-        "requestPayload": json.dumps(request_body) if request_body else "{}",
-        "responsePayload": json.dumps(response_body) if response_body else "{}",
+        "requestHeaders": json.dumps({"host": flow.request.pretty_host, "content-type": "application/json"}),
+        "requestPayload": json.dumps({
+            "jsonrpc": "2.0",
+            "id": call.get("id"),
+            "method": "tools/call",
+            "params": {"name": call.get("name"), "arguments": call.get("input")},
+        }),
+        "tag": tags,
+        "metadata": tags,
     })
+    if result:
+        payload["responseHeaders"] = json.dumps({"content-type": "application/json"})
+        payload["responsePayload"] = json.dumps({
+            "jsonrpc": "2.0",
+            "id": result["id"],
+            "result": {"content": result["content"], "isError": result["is_error"]},
+        })
     return payload
 
 
@@ -372,7 +383,7 @@ def return_akto_error(flow, validation, phase=None):
     )
 
 
-def request(flow: http.HTTPFlow):
+async def request(flow: http.HTTPFlow):
     if flow.request.path.startswith(AKTO_HEALTH_PATH):
         print(f"\n[HEALTH CHECK] {flow.request.method} {flow.request.pretty_url}")
         flow.response = http.Response.make(
@@ -388,14 +399,12 @@ def request(flow: http.HTTPFlow):
 
     print("\n================ REQUEST ================")
     print(flow.request.method)
-    print(flow.request.pretty_url)
+    print(urllib.parse.unquote(flow.request.pretty_url))
 
     payload = build_base_payload(flow)
 
-    validation = post_json(
-        AKTO_VALIDATE_URL,
-        payload
-    )
+    # Akto calls run in a thread so one slow verdict doesn't stall other flows.
+    validation = await asyncio.to_thread(post_json, CHECK_URL, payload)
 
     print("\n================ REQUEST VALIDATION ================")
     print(json.dumps(validation, indent=2))
@@ -405,13 +414,9 @@ def request(flow: http.HTTPFlow):
         return_akto_error(flow, validation, "requestResult")
         return
 
-    for tool_use, tool_result in tool_results_in_request(flow):
-        print(f"\n================ TOOL RESULT: {tool_use.get('name')} ================")
-        result_validation = post_json(AKTO_VALIDATE_URL, tool_payload(flow, tool_use, response_body={
-            "jsonrpc": "2.0",
-            "id": tool_result["id"],
-            "result": {"content": tool_result["content"], "isError": tool_result["is_error"]},
-        }))
+    for call, result in tool_results_in_request(flow):
+        print(f"\n================ TOOL RESULT: {call.get('name')} ================")
+        result_validation = await asyncio.to_thread(post_json, RECORD_URL, tool_payload(flow, call, result))
         if is_blocked(result_validation, "responseResult"):
             print(">>> TOOL RESULT BLOCKED BY AKTO")
             return_akto_error(flow, result_validation, "responseResult")
@@ -427,7 +432,7 @@ def request(flow: http.HTTPFlow):
     pending[flow.id] = payload
 
 
-def response(flow: http.HTTPFlow):
+async def response(flow: http.HTTPFlow):
     if flow.id not in pending:
         return
 
@@ -447,8 +452,6 @@ def response(flow: http.HTTPFlow):
     except Exception as e:
         print(f"[TOOL PARSE ERROR] {e!r}")
 
-    payload["requestHeaders"] = json.dumps({"host": flow.request.pretty_host})
-    payload["requestPayload"] = "{}"
     payload["responseHeaders"] = json.dumps(dict(flow.response.headers))
     payload["responsePayload"] = response_body
     payload["statusCode"] = str(flow.response.status_code)
@@ -457,10 +460,7 @@ def response(flow: http.HTTPFlow):
     print("\n================ RESPONSE ================")
     print(response_body[:2000])
 
-    response_validation = post_json(
-        AKTO_VALIDATE_URL,
-        payload
-    )
+    response_validation = await asyncio.to_thread(post_json, RECORD_URL, payload)
 
     print("\n================ RESPONSE VALIDATION ================")
     print(json.dumps(response_validation, indent=2))
@@ -474,12 +474,7 @@ def response(flow: http.HTTPFlow):
     # never runs.
     for call in calls:
         print(f"\n================ TOOL CALL: {call['name']} ================")
-        call_validation = post_json(AKTO_VALIDATE_URL, tool_payload(flow, call, request_body={
-            "jsonrpc": "2.0",
-            "id": call["id"],
-            "method": "tools/call",
-            "params": {"name": call["name"], "arguments": call["input"]},
-        }))
+        call_validation = await asyncio.to_thread(post_json, CHECK_URL, tool_payload(flow, call))
         if is_blocked(call_validation, "requestResult"):
             print(">>> TOOL CALL BLOCKED BY AKTO")
             return_akto_error(flow, call_validation, "requestResult")
